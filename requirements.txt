@@ -1,0 +1,14 @@
+# 桌面企鹅 · 依赖清单
+# 说明：只装 PySide6-Essentials（约 73MB），不装 PySide6 元包。
+# 元包会连带下载 PySide6-Addons（150MB+，含 QtWebEngine/Qt3D/QtCharts 等），
+# 本项目只用 QtCore/QtGui/QtWidgets，完全不需要，而且大包更容易下载中断。
+
+PySide6-Essentials==6.11.2
+shiboken6==6.11.2
+pynput==1.8.2
+psutil==7.2.2
+six==1.17.0
+
+# 安装方式（二选一）：
+#   1) 联网安装：  .venv\Scripts\python.exe -m pip install -r requirements.txt
+#   2) 离线安装：  python tools\offline_install.py
