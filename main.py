@@ -195,8 +195,12 @@ class DeskPet:
             self.hooks.start()
 
     def _first_hello(self) -> None:
+        # 只在「第一次启动」时打招呼；见过面后写 meta 标记，之后每次重启都不再弹
+        if self.storage.get_meta("met_before"):
+            return
         if not self.sm.is_proactive_blocked:
             self.show_bubble(lines.pick("first_meet"))
+        self.storage.set_meta("met_before", True)
 
     # ==================================================================
     # 动画 / 动作
