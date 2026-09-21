@@ -56,15 +56,26 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
 
 判据（按顺序）：
 
-1. 窗口可见、未最小化，且类名不在外壳白名单（`Progman` / `Shell_TrayWnd` 等）。
-2. **样式位必须没有** `WS_MAXIMIZE`、`WS_CAPTION`、`WS_THICKFRAME`、`WS_BORDER`
-   —— 即：不是最大化窗口，且连标题栏和边框都没有。真全屏应用（视频播放器、
-   PPT 放映、游戏）会把这些位全部去掉。
+1. 窗口可见、未最小化，且类名不在外壳白名单（`Progman` / `Shell_TrayWnd` 等），
+   也不以 `#3276` 开头（桌面窗口的类名是数字原子 `#32769`，不在白名单里）。
+2. **没有标题栏与边框**：样式位里不含 `WS_CAPTION` / `WS_THICKFRAME` / `WS_BORDER`。
 3. 尺寸 ≥ 显示器的 99%。
 
-> **为什么不能只看尺寸**：本机 1920x1080，窗口最大化后会占满 100% 工作区，
-> 单看尺寸会被误判成"全屏"。旧版用 92% 阈值，症状就是"把窗口最大化，企鹅就消失了"。
-> 加入样式位判断后，最大化窗口在第 2 步就被排除。
+> **不要检查 `WS_MAXIMIZE`**。这一点踩过坑，两个方向都错过：
+>
+> - 最早只看尺寸（92% 阈值）。最大化窗口占满工作区 → 误判全屏
+>   → 症状"窗口一最大化，企鹅就消失"。
+> - 修上一条时加了"有 `WS_MAXIMIZE` 就判非全屏"。但 **Chromium 系浏览器视频全屏时
+>   仍保留 `WS_MAXIMIZE`** → 真全屏被漏判 → 症状"浏览器看视频全屏，企鹅不隐藏"。
+>
+> 真机实测的两种形状（同一窗口 hwnd=1640492，Edge 播 bilibili）：
+>
+> | 状态 | rect | CAP / THICK / BORDER | MAX | 判定 |
+> |---|---|---|---|---|
+> | 最大化 | `(-7,-7,1543,831)`（比屏幕大，Win10+ 外扩约 7px） | 全 True | True | False |
+> | 视频全屏 | `(0,0,1536,864)`（精确铺满） | 全 False | True | **True** |
+>
+> 两者 `WS_MAXIMIZE` 都是 True，**只能靠"有没有边框"区分**。
 
 ### 1.4 隐私边界
 
@@ -440,14 +451,34 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
    需求是"只有全屏时隐藏，窗口化（含最大化）不隐藏"，但 `is_fullscreen` 原来
    只用尺寸判据（≥ 显示器 92%）。本机 1920×1080 下，最大化窗口**正好占满 100% 工作区**
    （含标题栏），于是被误判为全屏 → 企鹅消失。
-   修复：加入样式位判断，凡带 `WS_MAXIMIZE` / `WS_CAPTION` / `WS_THICKFRAME` / `WS_BORDER`
-   的窗口一律不算全屏（真全屏会移除这些位），尺寸阈值同时收紧到 99%。
+   修复：加入样式位判断，凡带 `WS_CAPTION` / `WS_THICKFRAME` / `WS_BORDER`
+   的窗口不算全屏，尺寸阈值同时收紧到 99%。
    实测验证：最大化窗口 ratio 0.776×0.907 → `False`；外壳窗口（`Shell_TrayWnd`）→ `False`。
 
    注意这个函数的**第二个调用点**：`sampler._passive_consuming()` 用它判断
    "看视频/玩游戏时人还在不在"。收紧后影响是：最大化窗口不再被当作"被动消费"，
    因此最大化状态下的长时间无输入会正常计入"离开"。这符合语义——最大化的是编辑器或
    浏览器，本就不该算被动消费；真正的视频/游戏仍由应用分类（`LEISURE_CATEGORIES`）兜住。
+
+11. **（2026-09-21 已修复）第 10 条的修复引入反向 bug：浏览器全屏时企鹅不隐藏。**
+   修第 10 条时顺手加了"`style & WS_MAXIMIZE` 就返回 False"，把最大化窗口排除掉。
+   但 **Chromium 系（Edge/Chrome）进入视频全屏后仍保留 `WS_MAXIMIZE` 位**，
+   只是把标题栏和边框去掉了 —— 于是真全屏被这条判断否决，企鹅不再隐藏。
+   用户报告"浏览器视频全屏时企鹅没有隐藏"，实测复现并定位。
+
+   真机抓到的两个形状（同一窗口 `hwnd=1640492`，Edge 播 bilibili）：
+
+   | 状态 | rect | MAX | CAP | THICK | BORDER | 旧判定 | 新判定 |
+   |---|---|---|---|---|---|---|---|
+   | 最大化 | `(-7,-7,1543,831)` | T | T | T | T | False | False |
+   | 视频全屏 | `(0,0,1536,864)` | **T** | F | F | F | **False（漏判）** | **True** |
+
+   修复：**移除 `WS_MAXIMIZE` 判断**，只保留"没有标题栏/边框 + 尺寸 ≥99%"。
+   区分两种状态靠的是边框而不是 `WS_MAXIMIZE`。
+   顺带修掉同一轮发现的另一个隐患：桌面窗口类名是数字原子 `#32769`（不在
+   `SHELL_CLASSES` 里），它铺满整屏且无边框，会被判成全屏 —— 现已用 `#3276`
+   前缀挡掉。另把 `GetWindowLongW` 的 `restype` 从 `c_long` 改为 `wintypes.DWORD`，
+   避免高位为 1 时读出负数（桌面窗口原先返回 `-1778384896`）。
 
 ## 8.1 回归测试（`tests/`）
 
@@ -456,8 +487,20 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
 | `test_analyzer.py` | 五维指标公式、分档函数、提醒调度、计分数学 |
 | `test_physics.py` | 抛球小游戏的物理 |
 | `test_care_triggers.py` | **关怀触发全链路**：见下 |
+| `test_fullscreen.py` | **全屏判定**：见下 |
 
-`test_care_triggers.py` 是为上述第 8/9/10 条 bug 写的回归测试，用替身
+`test_fullscreen.py` 为第 10/11 条 bug 写的回归测试。窗口形状取自真机实测，
+用 `_fake()` 临时替换 `winapi` 的取数函数来构造场景（不依赖真实窗口存在）。
+钉死的两个方向：
+
+- **必须判为全屏**：Chromium 视频全屏（`MAX=True` 但无边框，1536×864）、
+  F11 全屏、1535×864 的 1 像素容差情形。
+- **必须判为非全屏**：最大化窗口（`(-7,-7,1543,831)`，带边框）、
+  尺寸正好等于显示器的带边框窗口、半屏窗口、桌面原子类 `#32769`、
+  `Progman` / `WorkerW` / `Shell_TrayWnd`、不可见/最小化、矩形取不到。
+- 另含样式常量值校验与 `GetWindowLongW` 无符号性校验。
+
+`test_care_triggers.py` 是为上述第 8/9 条 bug 写的回归测试，用替身
 （`FakeStats` / `FakeSampler` / `FakeStorage` / `FakeStateMachine` / `FakeMain`）
 驱动**真实的** `CareManager`，不启动 Qt 窗口、不碰真实数据库。它固化了这些行为：
 
@@ -469,7 +512,7 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
 - **安静闸门**：全屏 / 会议 / 心流 都要让 `is_proactive_blocked` 为真，且健康提醒要受其约束。
 - **指标管线**：输入钩子全 0 时活跃度仍大于 0；`stayup` 按秒级（25200 秒）封顶。
 
-运行：
+运行（共 93 个用例）：
 
 ```
 .venv\Scripts\python.exe -m unittest discover -s tests -v

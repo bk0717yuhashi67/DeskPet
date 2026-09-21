@@ -183,7 +183,10 @@ user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWOR
 user32.OpenInputDesktop.restype = wintypes.HANDLE
 user32.CloseDesktop.argtypes = [wintypes.HANDLE]
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowLongW.restype = ctypes.c_long
+# 必须用 DWORD（无符号）读取样式：32 位样式里高位（如 WS_POPUP 0x80000000）
+# 会让 c_long 变成负数（实测桌面窗口返回 -1778384896）。
+# 按位与时虽仍能工作，但改成无符号更直观、也避免后续误用。
+user32.GetWindowLongW.restype = wintypes.DWORD
 user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
 user32.SetWindowLongW.restype = ctypes.c_long
 user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
@@ -290,24 +293,50 @@ def window_style(hwnd: int) -> int:
 def is_fullscreen(hwnd: int) -> bool:
     """窗口是否**真正**全屏占满一块显示器（排除桌面/任务栏外壳与最大化窗口）。
 
-    关键点：不能用"尺寸 >= 92% 显示器"当唯一判据。
-    实测本机 1920x1080，最大化的窗口占满 100% 工作区（含标题栏），
-    尺寸判据会把它误判成全屏 —— 症状是"只要把窗口最大化，企鹅就消失了"。
-    真正的全屏应用（视频播放器 / PPT 放映 / 游戏）会**移除标题栏与边框**，
-    所以这里先用样式位把带边框的窗口排除掉，再要求几乎完全覆盖显示器。
+    判据有三条，缺一不可：
+
+    1. 可见、未最小化，类名不在外壳白名单。
+    2. **没有标题栏与边框**（无 `WS_CAPTION` / `WS_THICKFRAME` / `WS_BORDER`）。
+       这是区分"全屏"与"普通最大化窗口"的关键：真全屏会移除这些装饰。
+    3. 窗口矩形 ≥ 显示器的 99%。
+
+    ### 为什么不看 WS_MAXIMIZE
+
+    最初的修复曾加过"有 `WS_MAXIMIZE` 就返回 False"，结果**浏览器视频全屏被漏判**。
+    2026-09-21 实测（Edge 播放 bilibili，视频切全屏）抓到的窗口形状：
+
+        rect=(0,0,1536,864)  mon=(0,0,1536,864)   ->  ratio 1.0000 x 1.0000
+        style=0x170B0000  MAX=True CAPTION=False THICK=False BORDER=False
+
+    即 Chromium 系在进入视频全屏后，**仍保留 `WS_MAXIMIZE` 位**，
+    同时把边框全部去掉、窗口精确铺满显示器。
+    而普通"最大化窗口"的形状是（Edge 最大化时实测）：
+
+        rect=(-7,-7,1543,831)  ->  比显示器更大（Win10+ 最大化会外扩约 7px）
+        style=0x17CF0000  MAX=True CAPTION=True THICK=True BORDER=True
+
+    两者都由 `WS_MAXIMIZE=True` 开头，所以**只能靠"有没有边框"来区分**：
+    最大化窗口有边框（第 2 条挡掉），全屏窗口没有（放行）。
+    因此这里刻意**不检查 `WS_MAXIMIZE`**。
+
+    ### 坐标系注意
+
+    `window_rect` 与 `monitor_rect` 取到的都是**同一空间**（本机实测均为
+    1536x864 逻辑像素，与 GetSystemMetrics 一致），可以直接相除；
+    Qt 侧 `main._on_flags` 只接收布尔结果，不涉及坐标换算。
     """
     if not hwnd or not is_visible(hwnd) or is_minimized(hwnd):
         return False
     cls = window_class(hwnd)
     if cls in SHELL_CLASSES:
         return False
+    # 桌面窗口的类名是数字原子 '#32769'，不会出现在 SHELL_CLASSES 里，
+    # 但它铺满整屏且无边框，会被误判成全屏 -> 单独挡掉。
+    if cls.startswith("#3276"):
+        return False
 
     style = window_style(hwnd)
-    # 最大化窗口有 WS_MAXIMIZE 标志：它不是全屏，企鹅不该隐藏
-    if style & WS_MAXIMIZE:
-        return False
-    # 带标题栏或可调边框的是普通窗口（最大化/拖大），也不是全屏。
-    # 真全屏会把这些位全部去掉。
+    # 带标题栏或可调边框的是普通窗口（含最大化），不是全屏。
     if style & (WS_CAPTION | WS_THICKFRAME | WS_BORDER):
         return False
 
