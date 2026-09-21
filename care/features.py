@@ -401,7 +401,11 @@ class CareManager(QObject):
         m = self._metrics
         if m is None or self.sm.is_proactive_blocked:
             return
-        if m.stayup < 50:
+        # 触发条件：连续晚睡（stayup>=50），或当前是凌晨 1-5 点（深夜还在电脑前）。
+        # 后者对应 mood.evaluate 返回的 CONCERN_STAYUP：之前因 stayup<50 直接提前返回，
+        # 导致凌晨被判定"熬夜关切"却一句话都不说、动作也不做（数据算了但没表达）。
+        early_hour = 1 <= time.localtime(now).tm_hour < 5
+        if m.stayup < 50 and not early_hour:
             return
         day = time.strftime("%Y-%m-%d", time.localtime(now))
         if self._stayup_day == day:
@@ -410,15 +414,14 @@ class CareManager(QObject):
         streak = self._late_streak()
         if streak >= 3:
             text = lines.pick("care_stayup_hard", n=streak)
-        elif m.stayup > 70:
-            text = lines.pick("care_stayup")
         else:
             text = lines.pick("care_stayup")
-        if not self.budget.can_speak(now, urgent=m.stayup > 70):
+        urgent = m.stayup > 70 or early_hour
+        if not self.budget.can_speak(now, urgent=urgent):
             return
         self.budget.record(now)
         self.pet_clip.emit("sad")
-        self.speak.emit(text, m.stayup > 70)
+        self.speak.emit(text, urgent)
 
     def _late_streak(self) -> int:
         rows = self.storage.metrics_range(4)

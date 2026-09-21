@@ -162,6 +162,7 @@ class Sampler(QObject):
     def _drain_events(self) -> None:
         q: queue.Queue = self.hooks.events
         got_keys = False
+        got_any = False
         for _ in range(4000):
             try:
                 ev = q.get_nowait()
@@ -177,20 +178,42 @@ class Sampler(QObject):
                     self.stats.backspaces += 1
                 self.stats.key_times.append(ts)
                 got_keys = True
+                got_any = True
             elif kind == "click":
                 if not self.enabled:
                     continue
                 _, _ts, name = ev
                 if name in ("left", "right", "middle"):
                     self.stats.clicks += 1
+                    got_any = True
             elif kind == "move":
                 if not self.enabled:
                     continue
                 _, _ts, dist = ev
                 self.stats.mouse_dist_px += int(dist)
+                got_any = True
 
         if got_keys:
             self._last_key_ts = time.time()
+
+        # 首次真正收到事件：确认钩子生效（日志在主线程，不违反钩子回调铁律）
+        if got_any and not getattr(self, "_logged_first_event", False):
+            self._logged_first_event = True
+            log.info("输入钩子已收到事件，键盘/鼠标统计正常")
+
+        # 启动后较久仍零事件：明确告警，便于定位钩子失效
+        if (
+            self.enabled
+            and got_any is False
+            and not getattr(self, "_logged_first_event", False)
+            and time.time() - self.hooks.start_ts > 60
+            and not self.hooks.warned_no_event
+        ):
+            self.hooks.warned_no_event = True
+            log.warning(
+                "启动 60 秒未收到任何键鼠事件，输入钩子可能未生效"
+                "（检查权限，或尝试以管理员身份运行 DeskPet）"
+            )
 
         # 钩子降级探测：前台一直在变但两分钟一个按键都没有
         if (

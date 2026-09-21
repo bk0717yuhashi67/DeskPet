@@ -119,7 +119,12 @@ class DeskPet:
         self.game.ended.connect(self._on_game_ended)
 
         # 关怀
-        self.care.speak.connect(lambda t, urgent=False: self.show_bubble(t, urgent=urgent))
+        # 预算已在 CareManager 各 _check_* 里先 can_speak 再 record 后才 emit，
+        # 这里必须 skip_budget，否则刚 record 完 last_at=now，show_bubble 再查一次
+        # can_speak 必失败，气泡被丢弃——这是"企鹅除了提醒从不主动说话"的真正根因。
+        self.care.speak.connect(
+            lambda t, urgent=False: self.show_bubble(t, urgent=urgent, skip_budget=True)
+        )
         self.care.pet_clip.connect(self.play)
         self.care.missed_provider = self.scheduler.take_missed
 
@@ -393,12 +398,20 @@ class DeskPet:
     # 气泡
     # ==================================================================
     def show_bubble(self, text: str, urgent: bool = False, buttons: bool = False,
-                    sticky: bool = False) -> None:
+                    sticky: bool = False, skip_budget: bool = False) -> None:
         if not text:
             return
-        if urgent:
+        quiet = bool(config.get("manual_quiet", False))
+        if skip_budget:
+            # 预算已在调用侧结算（CareManager 先 can_speak 再 record 后才 emit；
+            # 游戏/设置等是用户操作引起的回应，本就不该占打扰预算）。
+            # 这里若再查一次 can_speak，刚 record 完 last_at=now，间隔必然不满足，
+            # 气泡永远发不出去——2026-09-21 修复的正是这个双重闸门。
+            if quiet:
+                return
+        elif urgent:
             self.budget.record()
-        elif not config.get("manual_quiet", False):
+        elif not quiet:
             if not self.budget.can_speak():
                 log.debug("打扰预算已用尽，跳过气泡：%s", text[:16])
                 return
@@ -422,7 +435,7 @@ class DeskPet:
         r = self._current_reminder
         if r is not None:
             self.scheduler.add_temp(self.store.make_snooze(r, r.snooze_min))
-        self.show_bubble(lines.pick("remind_snooze"))
+        self.show_bubble(lines.pick("remind_snooze"), skip_budget=True)
 
     # ==================================================================
     # 提醒
@@ -555,7 +568,7 @@ class DeskPet:
 
     def _clear_all(self) -> None:
         self.storage.clear_all()
-        self.show_bubble("全部数据已清空。")
+        self.show_bubble("全部数据已清空。", skip_budget=True)
 
     def _create_shortcut(self) -> None:
         from app import shortcut

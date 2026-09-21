@@ -74,6 +74,7 @@ class InputHooks:
 
         self.running = started > 0
         self.degraded = self._kb_listener is None
+        self.start_ts = time.time()
         log.info(
             "输入钩子已启动（键盘=%s 鼠标=%s）",
             self._kb_listener is not None, self._ms_listener is not None,
@@ -104,6 +105,8 @@ class InputHooks:
             is_back = False
         now = time.time()
         # 只入队，不做任何其他事情
+        if self.first_event_ts is None:
+            self.first_event_ts = now
         self.events.put(("key", now, is_back))
 
     def _on_move(self, x: int, y: int) -> None:

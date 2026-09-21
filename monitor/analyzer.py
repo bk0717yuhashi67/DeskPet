@@ -72,7 +72,8 @@ def backspace_rate(keystrokes: int, backspaces: int) -> float:
 
 
 def switch_rate(switches: int, active_s: int) -> float:
-    hours = max(active_s / 3600.0, 0.1)
+    # 至少按 1 小时计，避免短时样本把切换率放大成几千次/小时
+    hours = max(active_s / 3600.0, 1.0)
     return switches / hours
 
 
@@ -97,19 +98,37 @@ def burst_stats(key_times: Sequence[float]) -> tuple[float, int]:
 
 
 # ---------------------------------------------------------------- 五维指标
-def focus_score(longest_focus_s: int, sr: float, br: float) -> float:
-    """专注度 = 最长专注块 50% + 少切换 30% + 少退格 20%。"""
+def focus_score(longest_focus_s: int, sr: float, br: float, keystrokes: int = 0) -> float:
+    """专注度 = 最长专注块 50% + 少切换 30% + 少退格 20%。
+
+    keystrokes 偏少时退格率不可信，f_back 退化为中性 0.5，
+    否则"没敲键盘"(br=0)会被误判为"退格极少 = 极度专注"（旧公式的退化异常）。
+    切换率分母阈值与 switch_band 对齐（60 次/小时）。
+    """
     f_block = scale(longest_focus_s, 2700.0)          # 45 分钟满分
-    f_switch = clamp(1.0 - sr / 40.0)
-    f_back = clamp(1.0 - (br - 0.08) / 0.22)
+    f_switch = clamp(1.0 - sr / 60.0)
+    if keystrokes < 50:
+        f_back = 0.5
+    else:
+        f_back = clamp(1.0 - (br - 0.08) / 0.22)
     return 100.0 * (0.50 * f_block + 0.30 * f_switch + 0.20 * f_back)
 
 
 def activity_score(keystrokes: int, clicks: int, mouse_px: int, active_s: int) -> tuple[float, float]:
-    """返回 (活跃度, 每分钟输入密度)。"""
+    """返回 (活跃度, 每分钟输入密度)。
+
+    活跃度 = 在场基础分量 + 输入密度分量：
+      - 在场分量：只要人在电脑前（active_s 有值）就给基础分，
+        避免"键盘钩子失效 / 纯鼠标操作 / 阅读思考"场景下活跃度恒为 0
+        （旧公式完全依赖输入密度，是设计缺陷）。
+      - 输入分量：仍以 ipm 为主驱动，高强度输入才能达到"高强度"。
+    """
     minutes = max(active_s / 60.0, 1.0)
     ipm = (keystrokes + 1.5 * clicks + mouse_px / 60.0) / minutes
-    return 100.0 * clamp((ipm - 15.0) / (220.0 - 15.0)), ipm
+    presence = clamp(active_s / 7200.0)                  # 在场 2 小时 = 满分基础
+    input_part = clamp((ipm - 10.0) / (180.0 - 10.0))    # 10 ipm 起算，170 ipm 满
+    score = 100.0 * (0.35 * presence + 0.65 * input_part)
+    return score, ipm
 
 
 def fatigue_score(
@@ -143,13 +162,19 @@ def stayup_score(
     prev_rolling: float | None = None,
     prev_two: Iterable[float] = (),
 ) -> float:
-    """熬夜指数：深夜活跃分钟数为主，加"凌晨还在用"的附加惩罚。"""
-    today = 100.0 * scale(late_minutes, 240.0)   # 4 小时封顶
+    """熬夜指数：深夜活跃秒数为主，加"凌晨还在用"的附加惩罚。
+
+    单位说明：sampler 按约 1 秒的采样 tick 累计 late_minutes，
+    故它实为"深夜活跃秒数"（非分钟）。旧阈值 240/420 按分钟设，
+    导致深夜活跃 >4/7 分钟即封顶 100——这是"每天都很高"的真正根因。
+    修正：封顶改用秒级（7 小时 = 25200 秒），并撤销误加的 today 权重。
+    """
+    today = 100.0 * scale(late_minutes, 25200.0)   # 7 小时封顶（秒级）
 
     if last_ts:
         h = time.localtime(last_ts).tm_hour
         if 0 <= h < 5:
-            today = min(100.0, today + 15.0)
+            today = min(100.0, today + 10.0)
     if first_ts and prev_rolling is not None and prev_rolling >= 60:
         if time.localtime(first_ts).tm_hour < 7:
             today = max(0.0, today - 10.0)
@@ -174,7 +199,7 @@ def flow_score(burst_med: float, wpm: float, br: float) -> float:
 
 def distraction_score(sr: float, longest_focus_s: int) -> float:
     f_block = scale(longest_focus_s, 2700.0)
-    return 100.0 * clamp(0.6 * scale(sr, 40.0) + 0.4 * (1.0 - f_block))
+    return 100.0 * clamp(0.6 * scale(sr, 60.0) + 0.4 * (1.0 - f_block))
 
 
 # ---------------------------------------------------------------- 汇总
@@ -202,7 +227,7 @@ def compute(
     m.focus_count = int(focus_count)
     m.continuous_s = int(continuous_s)
 
-    m.br = backspace_rate(m.keystrokes, m.backspaces)
+    m.br = backspace_rate(m.keystrokes, m.backspaces) if m.keystrokes >= 20 else 0.0
     m.sr = switch_rate(m.switches, m.active_s)
     m.activity, m.ipm = activity_score(m.keystrokes, m.clicks, m.mouse_px, m.active_s)
 
@@ -210,7 +235,7 @@ def compute(
     minutes = max(m.active_s / 60.0, 1.0)
     m.wpm = (m.keystrokes / 5.0) / minutes
 
-    m.focus = focus_score(m.longest_focus_s, m.sr, m.br)
+    m.focus = focus_score(m.longest_focus_s, m.sr, m.br, m.keystrokes)
     m.flow = flow_score(m.burst_med, m.wpm, m.br)
     m.distraction = distraction_score(m.sr, m.longest_focus_s)
 
@@ -256,21 +281,21 @@ def activity_band(v: float) -> str:
 
 
 def stayup_band(v: float) -> str:
-    if v >= 75:
+    if v >= 80:
         return "严重熬夜"
-    if v >= 50:
+    if v >= 55:
         return "连续晚睡"
-    if v >= 20:
+    if v >= 25:
         return "偶有晚睡"
     return "作息正常"
 
 
 def switch_band(sr: float) -> str:
-    if sr > 40:
+    if sr > 60:
         return "严重碎片化"
-    if sr > 20:
+    if sr > 35:
         return "偏分心"
-    if sr > 8:
+    if sr > 12:
         return "正常"
     return "深度专注"
 
