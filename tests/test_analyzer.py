@@ -32,18 +32,29 @@ class TestAnalyzer(unittest.TestCase):
         self.assertAlmostEqual(analyzer.switch_rate(20, 3600), 20.0)
 
     def test_focus_extremes(self):
-        # 满分级：45 分钟专注、几乎不切换、退格正常
-        high = analyzer.focus_score(2700, 0.0, 0.08)
+        # 满分级：45 分钟专注、几乎不切换、退格正常、输入量充足
+        high = analyzer.focus_score(2700, 0.0, 0.08, keystrokes=2000)
         # 极差：没有专注块、疯狂切换、退格率高
-        low = analyzer.focus_score(0, 200.0, 0.40)
+        low = analyzer.focus_score(0, 200.0, 0.40, keystrokes=2000)
         self.assertGreater(high, 95.0)
         self.assertLess(low, 5.0)
         self.assertLess(low, high)
 
+    def test_focus_degrades_without_input(self):
+        """回归：输入量极少时退格项取中性 0.5，不再被误判成"极度专注"。
+
+        旧公式里 br=0（没敲键盘）会被算成"退格极少"，专注度虚高到满分。
+        """
+        no_input = analyzer.focus_score(2700, 0.0, 0.0, keystrokes=0)
+        full = analyzer.focus_score(2700, 0.0, 0.08, keystrokes=2000)
+        self.assertLess(no_input, full)
+        # 中性分量下满分块 + 零切换 = 0.5 + 0.3 + 0.2*0.5 = 0.9
+        self.assertAlmostEqual(no_input, 90.0, places=6)
+
     def test_focus_monotonic_in_block(self):
         prev = -1.0
         for secs in (0, 600, 1200, 1800, 2400, 2700, 3600):
-            v = analyzer.focus_score(secs, 5.0, 0.08)
+            v = analyzer.focus_score(secs, 5.0, 0.08, keystrokes=2000)
             self.assertGreaterEqual(v, prev)
             prev = v
 
@@ -66,11 +77,20 @@ class TestAnalyzer(unittest.TestCase):
         self.assertGreater(smoothed, raw)
 
     def test_stayup(self):
+        """late_minutes 实为"深夜活跃**秒数**"（sampler 按 1 秒 tick 累计）。
+
+        历史 bug：旧阈值 240/420 按"分钟"设，导致深夜活跃 4 分钟就封顶 100，
+        表现为"每天都显示严重熬夜"。现改为 7 小时（25200 秒）封顶。
+        """
         self.assertEqual(analyzer.stayup_score(0, 0, 0), 0.0)
-        # 4 小时深夜活跃 => 100
-        self.assertAlmostEqual(analyzer.stayup_score(240, 0, 0), 100.0)
-        # 只有 1 小时 => 25
-        self.assertAlmostEqual(analyzer.stayup_score(60, 0, 0), 25.0)
+        # 1 小时深夜活跃 => 100/7 ≈ 14.3
+        self.assertAlmostEqual(analyzer.stayup_score(3600, 0, 0), 100 / 7, places=6)
+        # 4 小时 => 约 57.1，不该封顶
+        self.assertAlmostEqual(analyzer.stayup_score(14400, 0, 0), 100 * 4 / 7, places=6)
+        # 满 7 小时才到 100
+        self.assertAlmostEqual(analyzer.stayup_score(25200, 0, 0), 100.0, places=6)
+        # 超过 7 小时也不再涨
+        self.assertAlmostEqual(analyzer.stayup_score(40000, 0, 0), 100.0, places=6)
 
     def test_flow(self):
         weak = analyzer.flow_score(2.0, 5.0, 0.4)

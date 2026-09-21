@@ -46,6 +46,15 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
+# 样式位：用来区分"真全屏"和"最大化窗口"。
+# 最大化窗口在 1920x1080 上会占满 100% 工作区，尺寸判据对它完全失效，
+# 必须靠样式位识别（见 is_fullscreen）。
+GWL_STYLE = -16
+WS_MAXIMIZE = 0x01000000
+WS_CAPTION = 0x00C00000
+WS_THICKFRAME = 0x00040000
+WS_BORDER = 0x00800000
+
 MONITOR_DEFAULTTONEAREST = 2
 
 # 这些窗口类名即使在"全屏"尺寸下也不算真正的全屏应用
@@ -274,13 +283,34 @@ def monitor_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     return (r.left, r.top, r.right, r.bottom)
 
 
+def window_style(hwnd: int) -> int:
+    return int(user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE))
+
+
 def is_fullscreen(hwnd: int) -> bool:
-    """窗口是否真正全屏占满一块显示器（排除桌面/任务栏等外壳窗口）。"""
+    """窗口是否**真正**全屏占满一块显示器（排除桌面/任务栏外壳与最大化窗口）。
+
+    关键点：不能用"尺寸 >= 92% 显示器"当唯一判据。
+    实测本机 1920x1080，最大化的窗口占满 100% 工作区（含标题栏），
+    尺寸判据会把它误判成全屏 —— 症状是"只要把窗口最大化，企鹅就消失了"。
+    真正的全屏应用（视频播放器 / PPT 放映 / 游戏）会**移除标题栏与边框**，
+    所以这里先用样式位把带边框的窗口排除掉，再要求几乎完全覆盖显示器。
+    """
     if not hwnd or not is_visible(hwnd) or is_minimized(hwnd):
         return False
     cls = window_class(hwnd)
     if cls in SHELL_CLASSES:
         return False
+
+    style = window_style(hwnd)
+    # 最大化窗口有 WS_MAXIMIZE 标志：它不是全屏，企鹅不该隐藏
+    if style & WS_MAXIMIZE:
+        return False
+    # 带标题栏或可调边框的是普通窗口（最大化/拖大），也不是全屏。
+    # 真全屏会把这些位全部去掉。
+    if style & (WS_CAPTION | WS_THICKFRAME | WS_BORDER):
+        return False
+
     rect = window_rect(hwnd)
     mon = monitor_rect(hwnd)
     if rect is None or mon is None:
@@ -291,7 +321,8 @@ def is_fullscreen(hwnd: int) -> bool:
     mh = mon[3] - mon[1]
     if mw <= 0 or mh <= 0:
         return False
-    return w >= mw * 0.92 and h >= mh * 0.92
+    # 真全屏基本是像素级铺满，留 1% 容差应对 DPI 取整
+    return w >= mw * 0.99 and h >= mh * 0.99
 
 
 # ---------------------------------------------------------------- 锁屏
