@@ -29,9 +29,6 @@ from ui.style import DIALOG_QSS, center_on_screen
 from app.config import config
 from app.paths import DATA_DIR
 
-AUTOSTART_KEY = "DeskPetPenguin"
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
 
 def _read_time(text: str, fallback: str = "23:30") -> QTime:
     try:
@@ -321,39 +318,24 @@ class SettingsDialog(QDialog):
 
     # ------------------------------------------------------------ 自启
     def _autostart_enabled(self) -> bool:
-        try:
-            import winreg
+        """自启是否**真的**生效。
 
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-                val, _ = winreg.QueryValueEx(k, AUTOSTART_KEY)
-                return bool(val)
-        except FileNotFoundError:
+        不能只看注册表值是否非空：项目搬家后值仍然在，但里面的绝对路径
+        已经指不到程序了 —— 那样会显示"已开启"却其实起不来，
+        而且因为"想开的"和"检测到已开的"相等，点确定也不会重写，用户修不了。
+        """
+        from app.paths import autostart_is_valid, autostart_value
+
+        if autostart_value() is None:
+            # 从没写过注册表，退回配置文件里的偏好
             return bool(config.get("autostart", False))
-        except Exception:
-            return False
+        return autostart_is_valid()
 
     def _set_autostart(self, on: bool) -> bool:
-        from app.paths import launch_command
+        # 具体实现收在 app.paths 里（那里还有启动时的自检自愈），此处只做委托。
+        from app.paths import set_autostart
 
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
-            ) as k:
-                if on:
-                    winreg.SetValueEx(k, AUTOSTART_KEY, 0, winreg.REG_SZ, launch_command())
-                else:
-                    try:
-                        winreg.DeleteValue(k, AUTOSTART_KEY)
-                    except FileNotFoundError:
-                        pass
-            return True
-        except Exception as exc:
-            from app import logging_setup
-
-            logging_setup.get("settings").warning("设置开机自启失败: %s", exc)
-            return False
+        return set_autostart(on)
 
     # ------------------------------------------------------------ 保存
     def _on_ok(self) -> None:

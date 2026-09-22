@@ -648,6 +648,15 @@ def main() -> int:
         log.info("已有实例在运行，退出本次启动")
         return 0
 
+    # 开机自启的命令里存的是绝对路径快照，项目搬家后会失效。
+    # 这里自检一次：只在"用户确实开了自启、但路径已指不到当前程序"时才改写，
+    # 避免出现"设置里显示已开启、开机却起不来"的情况（用户没开自启则不动）。
+    state = paths.sync_autostart()
+    if state == "repaired":
+        log.info("开机自启指向的路径已失效，已自动更新为当前路径")
+    elif state == "failed":
+        log.warning("开机自启指向的路径已失效，且自动修复失败")
+
     pet_app = DeskPet(app)
     pet_app._server = server      # 必须持有引用，否则监听会被回收
     pet_app.start()
