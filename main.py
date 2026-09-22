@@ -101,6 +101,11 @@ class DeskPet:
         # 右键点企鹅本体也弹菜单（和托盘图标用的是同一个 QMenu 实例）
         self.pet.menu_requested.connect(self._show_menu_at_pet)
 
+        # 鼠标事件走 Raw Input：系统把 WM_INPUT 投递到宠物窗口，这里转交监听器。
+        # 不走全局钩子是为了不占用输入通路（钩子会让光标在高事件率下卡顿）。
+        self.pet.raw_input_sink = self.hooks.feed_raw_input
+        self.pet.native_ready.connect(self.hooks.set_raw_window)
+
         # 采样
         self.sampler.state_flags.connect(self._on_flags)
 

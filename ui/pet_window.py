@@ -54,6 +54,7 @@ class PetWindow(QWidget):
     power_resume = Signal()
     screen_geometry_changed = Signal()
     menu_requested = Signal()          # 右键点企鹅：请主程序弹菜单
+    native_ready = Signal(int)         # 窗口句柄就绪/变更（Raw Input 需要它）
 
     def __init__(self, animator: Animator, sm: StateMachine, parent=None) -> None:
         super().__init__(
@@ -93,6 +94,10 @@ class PetWindow(QWidget):
         self._probed = False
         self._positioned = False
         self._hidden_for_fullscreen = False
+        # Raw Input 事件出口：主程序会把它接到 InputHooks.feed_raw_input。
+        # 鼠标不走钩子了（钩子会占用输入通路、拖慢光标），改由系统把
+        # WM_INPUT 投递到这个窗口，再从这里转交。
+        self.raw_input_sink = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(FRAME_MS)
@@ -109,12 +114,19 @@ class PetWindow(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._hwnd = int(self.winId())
+        self.native_ready.emit(self._hwnd)
         if not self._probed:
             self._probed = True
             QTimer.singleShot(250, self._probe_click_through)
         if not self._positioned:
             self._positioned = True
             self._restore_position()
+
+    def hwnd(self) -> int:
+        """当前窗口句柄（可能触发一次原生窗口创建）。"""
+        if not self._hwnd:
+            self._hwnd = int(self.winId())
+        return self._hwnd
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
@@ -244,6 +256,16 @@ class PetWindow(QWidget):
             m = int(msg.message)
             if m == winapi.WM_NCHITTEST:
                 return self._handle_nchittest(msg)
+            if m == winapi.WM_INPUT:
+                # 鼠标原始输入（Raw Input）。这里必须放行给 Qt/DefWindowProc，
+                # 处理只是"把数据交出去"，不做任何重活。
+                sink = self.raw_input_sink
+                if sink is not None:
+                    try:
+                        sink(int(msg.lParam))
+                    except Exception as exc:
+                        log.debug("Raw Input 处理异常: %s", exc)
+                return super().nativeEvent(event_type, message)
             if m == winapi.WM_MOUSEACTIVATE:
                 # 绝不因为被点一下就抢走用户的输入焦点
                 return True, winapi.MA_NOACTIVATE

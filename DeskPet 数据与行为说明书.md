@@ -31,7 +31,7 @@
 | 周期 | 做什么 |
 |---|---|
 | 1 秒 | 前台窗口句柄、空闲时长（GetLastInputInfo） |
-| 500 毫秒 | 消费键鼠钩子队列（单批最多 4000 条） |
+| 500 毫秒 | 消费输入事件队列（单批最多 4000 条） |
 | 2 秒 | 全屏 / 会议检测（决定要不要自动静音） |
 | 30 秒 | 落库（或前台切换时立刻落库） |
 
@@ -39,6 +39,20 @@
 
 active_s｜idle_s｜locked_s｜keystrokes｜backspaces｜clicks｜mouse_dist_px｜
 app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s｜first_ts｜last_ts
+
+### 1.2.1 这 14 项从哪来（输入源）
+
+| 来源 | 采什么 | 为什么 |
+|---|---|---|
+| **鼠标 Raw Input**（`WM_INPUT`） | `clicks`、`mouse_dist_px` | 系统把事件**投递**到宠物窗口消息队列，不占用输入通路。读的是光标**绝对位置**，消息被延迟处理也不丢数据 |
+| **键盘全局钩子**（pynput `WH_KEYBOARD_LL`） | `keystrokes`、`backspaces` | 键盘事件率低（10 次/秒量级），钩子代价可忽略；且需要按键的**是什么键**（退格），Raw Input 给不到 |
+| **`GetLastInputInfo`** | `idle_s`（→ `active_s`） | 零成本，不装任何钩子也能拿 |
+| **轮询前台窗口** | `app_switches`、`locked_s` | 1 秒一次的 `GetForegroundWindow` |
+
+> **鼠标为什么不用钩子**：`WH_MOUSE_LL` 要求把**每一个**鼠标事件同步交给我们的线程，
+> 真实鼠标 500~1000 次/秒，尾延迟会被拉长到肉眼可见 —— 症状就是"启动企鹅后光标卡顿"。
+> 详见第 12 条。`hooks.mouse_mode` 记录当前实际用的是哪条链路（`raw` / `hook` / `none`），
+> Raw Input 注册失败时会退回钩子并写告警日志。
 
 ### 1.3 三个关键判定规则
 
@@ -446,6 +460,8 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
      **"启动 60 秒未收到任何键鼠事件，输入钩子可能未生效"** 告警。重启后看 `data/logs/pet.log`
      即可确认钩子到底有没有活——若只看到告警没有"正常"日志，就是钩子本身环境问题
      （权限 / 安全软件 / RDP 会话），需以管理员身份运行或在 PyCharm 里调试。
+   - **后续更正**：这条当时把根因猜成了"钩子环境问题"，其实是自己的代码 ——
+     回调每次都在抛 `AttributeError` 并被 pynput 静默吞掉。见下面第 13 条。
 
 10. **（2026-09-21 已修复）全屏判定把最大化窗口当成了全屏，导致企鹅被误隐藏。**
    需求是"只有全屏时隐藏，窗口化（含最大化）不隐藏"，但 `is_fullscreen` 原来
@@ -480,6 +496,52 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
    前缀挡掉。另把 `GetWindowLongW` 的 `restype` 从 `c_long` 改为 `wintypes.DWORD`，
    避免高位为 1 时读出负数（桌面窗口原先返回 `-1778384896`）。
 
+12. **（2026-09-22 已修复）装了鼠标全局钩子后光标卡顿。**
+   用户报告"启动企鹅后鼠标光标变得卡顿"。逐项排除后定位到 `monitor/hooks.py`
+   里 pynput 的 `WH_MOUSE_LL` 鼠标钩子：钩子要求系统把**每一个**鼠标事件
+   **同步**交给我们的线程，事件率高时（真实鼠标 500~1000 次/秒）输入通路的
+   尾延迟明显变长，表现为光标偶发卡顿。
+
+   实测方法（`probe_mouse_latency.py`）：自己装一个极简钩子记录
+   `latency = GetTickCount() - MSLLHOOKSTRUCT.time`（事件产生 → 钩子收到），
+   并用 `SendInput` 注入鼠标移动测其往返耗时；中途启动企鹅做 A/B。
+   钩子链顺序已单独验证为"后装的先被调用"，所以探针（先装）测到的延迟包含企鹅的耗时。
+
+   | 配置 | 光标往返 p99 | 光标往返最大 |
+   |---|---|---|
+   | 企鹅未运行 | 3.42 ms | 28.3 ms |
+   | 企鹅运行（钩子） | **6.76 ms** | **31.4 ms** |
+   | 企鹅运行（`collect_input=false`，无钩子） | 3.29 ms | 27.9 ms |
+
+   同一轮里被实测排除的其它嫌疑：钩子回调本身只要 0.019 ms/次（占运行时间 0.47%）；
+   进程仅占 12.3% 单核且无忙等线程；没有大尺寸隐藏窗口；代码里没有改光标位置/形状的调用；
+   单帧绘制 4.1 ms（p95 6.8 ms）；GC 无长停顿（最长 7.55 ms，25 秒仅 2 次）。
+
+   修复：鼠标改走 **Raw Input**（`RIDEV_INPUTSINK`）。系统把 `WM_INPUT` 投递到
+   宠物窗口的消息队列，**完全不参与输入通路**，因此处理慢一点也不会拖住输入线程；
+   它读的是光标绝对位置，消息即使被延迟处理也不会丢数据。
+   键盘仍用 pynput 钩子（按键在 10 次/秒量级，对输入通路的影响可忽略）。
+
+   修复后复测：p99 从 6.76 ms 降到 **2.58 ms**，最大从 31.4 ms 降到 3.25 ms。
+   Raw Input 注册失败时自动退回钩子，`hooks.mouse_mode` 会记为 `hook` 并写告警日志。
+
+13. **（2026-09-22 已修复）键盘统计从始至终为 0，而且没有任何报错。**
+   `monitor/hooks.py` 的 `_on_press` 里读 `self.first_event_ts`，但 `__init__`
+   从未初始化它 —— 每次按键都在回调里抛 `AttributeError`；而 pynput 把回调异常
+   存进 `_exception`、只在 `join()` 时重抛（本程序从不 join），异常被静默吞掉，
+   于是**一个按键都记不上**。
+
+   真机证据：日志里一整天都是 `今日已有数据: active=529s keys=0`，
+   以及被误报的"键盘统计可能不完整（管理员权限程序内的输入收不到）"。
+   也就是说这条告警一直在指向权限问题，真实原因是自己的代码。
+
+   同类隐患还有两处，一并修掉：`hooks.start_ts`（`sampler._drain_events` 直接读，
+   而 pynput 不可用时 `start()` 会提前返回、不设置它）与 `hooks.warned_no_event`
+   （`sampler` 只在告警分支里才创建它，第一次判定就会抛 AttributeError）。
+   三处现在都在 `InputHooks.__init__` 里统一初始化。
+
+   实测：注入 10 个字母键 + 3 个退格，`keystrokes` / `backspaces` 分别 +13 / +3。
+
 ## 8.1 回归测试（`tests/`）
 
 | 文件 | 覆盖 |
@@ -488,6 +550,22 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
 | `test_physics.py` | 抛球小游戏的物理 |
 | `test_care_triggers.py` | **关怀触发全链路**：见下 |
 | `test_fullscreen.py` | **全屏判定**：见下 |
+| `test_autostart.py` | **开机自启**路径校验与启动自愈 |
+| `test_raw_input.py` | **鼠标 Raw Input**与输入源装配：见下 |
+
+`test_raw_input.py` 为第 12/13 条写的回归测试。用假的 `winapi` 与假的 pynput
+（不装任何真实钩子、不注册任何真实设备）钉死这些行为：
+
+- **输入源选择**：Raw Input 可用时装载它并且**绝不**同时装钩子；窗口句柄未就绪时
+  先不动鼠标（不能为了"先用上"而退回钩子）；注册失败才退回钩子。
+- **数据协议不变**：队列仍是 `("move", ts, dist)` / `("click", ts, name)`，
+  按钮位到 `left/right/middle/x1/x2` 的映射、距离节流（6px）、
+  大跳变丢弃（>500px）、纯按键包不产生位移。
+- **解析失败要安静**：非鼠标事件或解析失败返回 False，不抛异常、不入队。
+- **结构体布局**：`RAWINPUTDEVICE`/`RAWINPUTHEADER` 的尺寸，以及
+  "按钮位在 `ulButtons` 低 16 位"这个 union 假设 —— 布局错了会静默读垃圾数据。
+- **键盘计数回归**：`_on_press` 不抛异常、事件入队、`first_event_ts` 被赋值、
+  采样器直接读的三个属性都存在。
 
 `test_fullscreen.py` 为第 10/11 条 bug 写的回归测试。窗口形状取自真机实测，
 用 `_fake()` 临时替换 `winapi` 的取数函数来构造场景（不依赖真实窗口存在）。
@@ -512,7 +590,7 @@ app_switches｜late_minutes｜idle_gap_cnt｜focus_block_cnt｜longest_focus_s�
 - **安静闸门**：全屏 / 会议 / 心流 都要让 `is_proactive_blocked` 为真，且健康提醒要受其约束。
 - **指标管线**：输入钩子全 0 时活跃度仍大于 0；`stayup` 按秒级（25200 秒）封顶。
 
-运行（共 93 个用例）：
+运行（共 134 个用例）：
 
 ```
 .venv\Scripts\python.exe -m unittest discover -s tests -v

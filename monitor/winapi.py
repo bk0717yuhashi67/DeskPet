@@ -4,6 +4,7 @@
   * 前台窗口 / 窗口标题 / 进程 PID
   * 空闲时长（GetLastInputInfo，零成本）
   * 光标位置
+  * 鼠标原始输入（Raw Input，替代全局钩子）
   * 全屏检测
   * 锁屏会话通知
   * 窗口点击穿透相关的窗口样式操作
@@ -27,6 +28,7 @@ WM_LBUTTONUP = 0x0202
 WM_MOUSEACTIVATE = 0x0021
 WM_POWERBROADCAST = 0x0218
 WM_WTSSESSION_CHANGE = 0x02B1
+WM_INPUT = 0x00FF
 
 HTTRANSPARENT = -1
 HTCLIENT = 1
@@ -45,6 +47,29 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+
+# ---- Raw Input：鼠标事件走"消息投递"而不是钩子，不占用输入通路 ----
+# 这是屏幕取词、游戏里读鼠标的标准做法：SetWindowsHookEx(WH_MOUSE_LL)
+# 要求系统把**每一个**鼠标事件同步交给我们的线程（事件率高时拖慢光标），
+# 而 Raw Input 只是把事件投递到窗口消息队列，处理慢一点也不会卡住输入。
+RIDEV_REMOVE = 0x00000001
+RIDEV_INPUTSINK = 0x00000100      # 窗口不在前台也照收（桌宠必备）
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_MOUSE = 0x02
+
+RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001
+RI_MOUSE_LEFT_BUTTON_UP = 0x0002
+RI_MOUSE_RIGHT_BUTTON_DOWN = 0x0004
+RI_MOUSE_RIGHT_BUTTON_UP = 0x0008
+RI_MOUSE_MIDDLE_BUTTON_DOWN = 0x0010
+RI_MOUSE_MIDDLE_BUTTON_UP = 0x0020
+RI_MOUSE_BUTTON_4_DOWN = 0x0040
+RI_MOUSE_BUTTON_4_UP = 0x0080
+RI_MOUSE_BUTTON_5_DOWN = 0x0100
+RI_MOUSE_BUTTON_5_UP = 0x0200
+RI_MOUSE_WHEEL = 0x0400
 
 # 样式位：用来区分"真全屏"和"最大化窗口"。
 # 最大化窗口在 1920x1080 上会占满 100% 工作区，尺寸判据对它完全失效，
@@ -107,6 +132,50 @@ class MSG(ctypes.Structure):
         ("pt_x", wintypes.LONG),
         ("pt_y", wintypes.LONG),
     ]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", wintypes.USHORT),
+        ("usUsage", wintypes.USHORT),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTarget", wintypes.HWND),
+    ]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", wintypes.DWORD),
+        ("dwSize", wintypes.DWORD),
+        ("hDevice", wintypes.HANDLE),
+        ("wParam", wintypes.WPARAM),
+    ]
+
+
+class RAWMOUSE(ctypes.Structure):
+    """注意 usFlags 后面的 union：原生布局是
+    `union { ULONG ulButtons; struct { USHORT usButtonFlags; USHORT usButtonData; }; }`，
+    这里按等价的 DWORD 读，按钮位取低 16 位（见 raw_mouse_flags）。
+    """
+    _fields_ = [
+        ("usFlags", wintypes.USHORT),
+        ("ulButtons", wintypes.DWORD),
+        ("ulRawButtons", wintypes.DWORD),
+        ("lLastX", wintypes.LONG),
+        ("lLastY", wintypes.LONG),
+        ("ulExtraInformation", wintypes.DWORD),
+    ]
+
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [
+        ("header", RAWINPUTHEADER),
+        ("mouse", RAWMOUSE),
+    ]
+
+
+# 复用同一个缓冲：鼠标事件最频繁时可达 1000 次/秒，不值得每次分配
+_RAW_BUF = RAWINPUT()
 
 
 _MSG_SIZE = ctypes.sizeof(MSG)
@@ -191,6 +260,15 @@ user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
 user32.SetWindowLongW.restype = ctypes.c_long
 user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.SendMessageW.restype = ctypes.c_ssize_t
+user32.RegisterRawInputDevices.argtypes = [
+    ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT
+]
+user32.RegisterRawInputDevices.restype = wintypes.BOOL
+user32.GetRawInputData.argtypes = [
+    wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p,
+    ctypes.POINTER(wintypes.UINT), wintypes.UINT,
+]
+user32.GetRawInputData.restype = wintypes.UINT
 kernel32.GetTickCount64.restype = ctypes.c_ulonglong
 kernel32.GetTickCount64.argtypes = []
 if wtsapi32 is not None:
@@ -407,3 +485,47 @@ def send_nchittest(hwnd: int, screen_x: int, screen_y: int) -> int:
     )
     # 结果按有符号 16 位解释
     return ctypes.c_short(res & 0xFFFF).value if res is not None else 0
+
+
+# ---------------------------------------------------------------- Raw Input（鼠标）
+def register_raw_mouse(hwnd: int, enable: bool = True) -> bool:
+    """注册 / 注销鼠标的原始输入。
+
+    `RIDEV_INPUTSINK` 让窗口在**不是前台**时也能收到 `WM_INPUT` —— 这正是
+    桌宠需要的。注销时必须带 `RIDEV_REMOVE` 且目标窗口为 NULL（MSDN 要求）。
+    """
+    if enable:
+        if not hwnd:
+            return False
+        rid = RAWINPUTDEVICE(
+            HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE,
+            RIDEV_INPUTSINK, wintypes.HWND(hwnd),
+        )
+    else:
+        rid = RAWINPUTDEVICE(
+            HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE, RIDEV_REMOVE, None
+        )
+    return bool(
+        user32.RegisterRawInputDevices(
+            ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)
+        )
+    )
+
+
+def raw_mouse_input(lparam: int) -> tuple[int, int, int] | None:
+    """解析 `WM_INPUT` 的 lParam，返回 `(dx, dy, 按钮位)`。
+
+    `dx/dy` 是**原始增量**（鼠标计数单位，非屏幕像素），负值表示反向移动；
+    某次事件里增量可能为 0（例如只按了键）。按钮位见 `RI_MOUSE_*` 常量。
+    非鼠标事件或解析失败返回 None。
+    """
+    size = wintypes.UINT(ctypes.sizeof(RAWINPUT))
+    got = user32.GetRawInputData(
+        wintypes.HANDLE(lparam), RID_INPUT,
+        ctypes.byref(_RAW_BUF), ctypes.byref(size),
+        ctypes.sizeof(RAWINPUTHEADER),
+    )
+    if got <= 0 or _RAW_BUF.header.dwType != RIM_TYPEMOUSE:
+        return None
+    m = _RAW_BUF.mouse
+    return (int(m.lLastX), int(m.lLastY), int(m.ulButtons) & 0xFFFF)
